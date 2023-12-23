@@ -1,3 +1,9 @@
+// Disabling the terminal window on Windows.
+#![cfg_attr(
+	target_os = "windows",
+	windows_subsystem = "windows"
+)]
+
 use chrono::Local;
 
 fn setup_logger() -> Result<(), fern::InitError> {
