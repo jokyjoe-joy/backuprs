@@ -24,8 +24,12 @@ pub struct AuthEnv {
 // TODO: Make this function's example doc run?!
 /// Reads a JSON file of base64 encoded credentials.
 /// 
+/// # Returns
+/// 
+/// * An `AuthEnv` struct of base64 decoded credentials with the structure of `{ email, password }`
+/// 
 /// # Examples
-/// ```no_run
+/// ```ignore
 /// let auth_info = read_auth_info("./auth_env.json").unwrap();
 /// let AuthEnv { email, password } = auth_info;
 /// ```

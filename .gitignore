@@ -1,3 +1,7 @@
+# Rust build files
 /target
+
+# BackupRS specific
 *.tar.gz
 auth_env.json
+*.log
