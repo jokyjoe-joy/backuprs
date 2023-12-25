@@ -5,6 +5,7 @@
 )]
 
 use chrono::Local;
+mod error;
 
 fn setup_logger() -> Result<(), fern::InitError> {
     fern::Dispatch::new()
@@ -30,12 +31,17 @@ fn main() {
         Ok(()) => (),
         Err(e) => {
             // TODO: There must be an easier and simpler way to do this.
-            if e.is::<backuprs::TarballExistsError>() || e.is::<backuprs::MEGAFileExistsError>() {
+            // TODO: Check for MultipleFoldersError, etc.?
+            if 
+                e.is::<error::TarballExistsError>() || 
+                e.is::<error::MEGAFileExistsError>()
+            {
                 log::error!("{}", e);
             }
             else {
                 // Panic if unknown error has been found, since this
                 // can only happen if there is a bug in the application.
+                log::error!("{:?}", e);
                 panic!("{:?}", e);
             }
         }

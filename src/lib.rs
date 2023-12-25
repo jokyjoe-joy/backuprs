@@ -2,7 +2,6 @@
 //! aka. BACKUP.rs
 
 use std::path::Path;
-use std::{fs, io};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use chrono;
@@ -14,78 +13,112 @@ use utils::AuthEnv;
 use log::{info, error};
 
 mod utils;
+mod error;
 
-#[derive(Debug)]
-pub struct TarballExistsError {
-    file_name: String
+/// TODO! Document this
+/// 
+/// Note: `mega_client.logout()` is called when the struct is dropped.
+struct BackupClient {
+    mega_client: mega::Client,
+    dropped: bool
 }
 
-impl std::error::Error for TarballExistsError {}
-
-impl std::fmt::Display for TarballExistsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f, 
-            "Tried to create a file with filename `{}`, which already exists. \
-            Try to specify a different filename or consider using randomly generated \
-            designations.",
-            self.file_name
-        )
-    }
-}
-
-#[derive(Debug)]
-pub struct MEGAFileExistsError {
-    file_name: String
-}
-
-impl std::error::Error for MEGAFileExistsError {}
-
-impl std::fmt::Display for MEGAFileExistsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Tried to upload a file with filename `{}`, but it already exists \
-            in the cloud drive. Try to specify a different filename or consider \
-            using randomly generated designations.",
-            self.file_name
-        )
-    }
-}
-
-#[allow(dead_code)]
-fn read_path(path: &str) -> Result<Vec<String>, io::Error> {
-    // Read path into an iterator.
-    let paths_in_dir = fs::read_dir(path);
-
-    // Check if path exists.
-    // If it doesn't exist return error to caller.
-    let paths_in_dir = match paths_in_dir {
-        Ok(path) => path,
-        Err(e) => match e.kind() {
-            io::ErrorKind::NotFound => return Err(e),
-            _ => panic!("{}", e)
-        },
-    };
-
-    // Create a vector for storing the path names of the files.
-    let mut files: Vec<String> = vec![];
-
-    // Loop through each file/folder we've found in the directory. 
-    for path in paths_in_dir {
-        let path = path.unwrap();
-
-        // If it is a directory, then read that directory as well.
-        if path.metadata().unwrap().is_dir() {
-            let path_name = path.path().display().to_string();
-            let mut found_files = read_path(&path_name).unwrap();
-            files.append(&mut found_files);
-        } else {
-            files.push(path.path().display().to_string());
+impl BackupClient {
+    pub fn default() -> Self {
+        let http_client = reqwest::Client::new();
+        let client = mega::Client::builder().build(http_client).unwrap();
+        BackupClient {
+            mega_client: client,
+            dropped: false
         }
     }
 
-    Ok(files)
+    pub async fn login(&mut self, email: &str, password: &str, mfa: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        self.mega_client.login(email, password, mfa).await?;
+        Ok(())
+    }
+
+    /// Uploads file to an already created folder in MEGA drive.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `file_name` - A string slice with the name of the file to upload
+    /// * `dest_folder` - A string slice with the name of the destination directory, which must be already created in the drive
+    pub async fn upload_file(&self, file_name: &str, dest_folder: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let nodes = self.mega_client.fetch_own_nodes().await?;
+        let file_name = Path::new(file_name).file_name().unwrap().to_str().unwrap();
+        
+        // Filters nodes to only contain folders with the name of `dest_folder`.
+        let folder_nodes: Vec<_> = nodes.iter().filter(|&node| {
+            node.name() == dest_folder && node.kind() == mega::NodeKind::Folder
+        }).collect();
+
+        if folder_nodes.len() > 1 { return Err(error::UploadError::MultipleFoldersError.into()); }
+        else if folder_nodes.len() < 1 { return Err(error::UploadError::NoFolderError.into()); }
+        
+        // The node of `dest_folder` must be the only one in the vector.
+        let dest_folder_node = *folder_nodes.first().unwrap();
+
+        // Check if a file with the same name is already uploaded in the same folder.
+        let file_nodes : Vec<_> = nodes.iter().filter(|&node| { 
+            node.name() == file_name && 
+            node.kind() == mega::NodeKind::File && 
+            node.parent() == Some(dest_folder_node.handle())
+        }).collect();
+
+        // If there is a file with the same name in the same folder, return an error.
+        if file_nodes.len() > 0 { 
+            return Err(error::MEGAFileExistsError{ file_name: String::from(file_name) }.into()); 
+        }
+
+        // Open file and read size to specify the length of the progress bar.
+        let file = tokio::fs::File::open(file_name).await?;
+        let size = file.metadata().await?.len();
+
+        // TODO! Remove progressbar?
+        // Setting up progressbar
+        let bar = indicatif::ProgressBar::new(size);
+        bar.set_style(utils::progress_bar_style());
+        bar.set_message(format!("Uploading {} to {}...", file_name, dest_folder_node.name()));
+        let bar = Arc::new(bar);
+
+        let reader = {
+            let bar = bar.clone();
+            file.report_progress(Duration::from_millis(100), move |bytes_read| {
+                bar.set_position(bytes_read as u64);
+            })
+        };
+
+        self.mega_client.upload_node(
+            &dest_folder_node,
+            file_name,
+            size,
+            reader.compat(),
+            mega::LastModified::Now,
+        ).await?;
+
+        bar.finish_with_message(format!("{} uploaded to {} !", file_name, dest_folder_node.name()));
+
+        Ok(())
+    }
+}
+
+// When the client goes out of scope, user is gracefully logout first.
+// First thought would be to call std::mem::take, which leaves a default
+// in its place, but this runs into a problem; you'll end up with a stack 
+// overflow calling drop. So, we have to use a flag to indicate it's been dropped.
+// For more info, see: https://stackoverflow.com/questions/71541765/rust-async-drop
+impl Drop for BackupClient {
+    fn drop(&mut self) {
+        if !self.dropped {
+            let mut this = BackupClient::default();
+            // `self` would escape the method body, therefore it is necessary to
+            // swap the values.
+            std::mem::swap(&mut this, self);
+            this.dropped = true;
+            tokio::spawn(async move { this.mega_client.logout().await });
+        }
+    }
 }
 
 /// Creates a tar.gz archive from all the folder paths that are given in `dirs`.
@@ -101,7 +134,7 @@ fn read_path(path: &str) -> Result<Vec<String>, io::Error> {
 fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Check if file already exists.
     match Path::new(file_name).try_exists() {
-        Ok(true) => return Err(TarballExistsError{file_name: String::from(file_name)}.into()),
+        Ok(true) => return Err(error::TarballExistsError{file_name: String::from(file_name)}.into()),
         Ok(false) => (),
         Err(e) => return Err(e.into())
     };
@@ -155,7 +188,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Created tarball successfully.");
     info!("Uploading file to MEGA.");
 
-    match upload_file(&file_name, "Backups").await {
+    let settings_file = "./auth_env.json";
+    let AuthEnv { email: email_decoded, password: pass_decoded } = utils::read_auth_info(settings_file).unwrap();
+    let mfa: Option<&str> = None;
+
+    let mut client = BackupClient::default();
+    client.login(&email_decoded, &pass_decoded, mfa).await?;
+
+    match client.upload_file(&file_name, "Backups").await {
         Ok(()) => (),
         Err(e) => {
             // Cleanup before returning error to main.
@@ -172,81 +212,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Removing archive file...");
     std::fs::remove_file(file_name)?;
     info!("Successfully removed archive file...");
-
-    Ok(())
-}
-
-/// Uploads file to an already created folder in MEGA drive.
-/// 
-/// # Arguments
-/// 
-/// * `file_name` - A string slice with the name of the file to upload
-/// * `dest_folder` - A string slice with the name of the destination directory, which must be already created in the drive
-async fn upload_file(file_name: &str, dest_folder: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let settings_file = "./auth_env.json";
-    let AuthEnv { email: email_decoded, password: pass_decoded } = utils::read_auth_info(settings_file).unwrap();
-    let mfa: Option<&str> = None;
-
-    let http_client = reqwest::Client::new();
-    let mut mega = mega::Client::builder().build(http_client).unwrap();
-
-    mega.login(&email_decoded, &pass_decoded, mfa).await
-        .expect("Login has failed.");
-
-    let nodes = mega.fetch_own_nodes().await?;
-    let file_name = Path::new(file_name).file_name().unwrap().to_str().unwrap();
-
-    // Filters nodes to only contain folders with the name of `dest_folder`.
-    let folder_nodes: Vec<_> = nodes.iter().filter(|&node| {
-        node.name() == dest_folder && node.kind() == mega::NodeKind::Folder
-    }).collect();
-
-    // TODO: Don't panic?!
-    if folder_nodes.len() > 1 { panic!("Multiple folders found with specified name."); }
-    else if folder_nodes.len() < 1 { panic!("No folder is found with specified name."); }
-    // The node of `dest_folder` must be the only one in the vector.
-    let dest_folder_node = *folder_nodes.first().unwrap();
-
-    // Check if a file with the same name is already uploaded in the same folder.
-    let file_nodes : Vec<_> = nodes.iter().filter(|&node| { 
-        node.name() == file_name && node.kind() == mega::NodeKind::File && node.parent() == Some(dest_folder_node.handle())
-    }).collect();
-
-    // If there is a file with the same name in the same folder, return an error.
-    if file_nodes.len() > 0 { 
-        return Err(MEGAFileExistsError{ file_name: String::from(file_name) }.into()); 
-    }
-
-    // Open file and read size to specify the length of the progress bar.
-    let file = tokio::fs::File::open(file_name).await?;
-    let size = file.metadata().await?.len();
-
-    // Setting up progressbar
-    let bar = indicatif::ProgressBar::new(size);
-    bar.set_style(utils::progress_bar_style());
-    bar.set_message(format!("Uploading {} to {}...", file_name, dest_folder_node.name()));
-    let bar = Arc::new(bar);
-
-    let reader = {
-        let bar = bar.clone();
-        file.report_progress(Duration::from_millis(100), move |bytes_read| {
-            bar.set_position(bytes_read as u64);
-        })
-    };
-
-    // Uploading file to MEGA
-    mega.upload_node(
-        &dest_folder_node,
-        file_name,
-        size,
-        reader.compat(),
-        mega::LastModified::Now,
-    )
-    .await?;
-
-    bar.finish_with_message(format!("{} uploaded to {} !", file_name, dest_folder_node.name()));
-    
-    mega.logout().await.unwrap();
 
     Ok(())
 }
@@ -272,4 +237,6 @@ mod tests {
         std::fs::remove_file(file_name).unwrap();
         assert!(!file_path.exists())
     }
+
+    // TODO: Write tests for BackupClient.
 }
