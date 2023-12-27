@@ -1,0 +1,8 @@
+{
+    "email": "MYEMAILINBASE64=",
+    "password": "MYPASSWORDINBASE64=",
+    "dirs_to_backup": [
+        "C:\\Users\\username\\Documents\\BackupFolder",
+        "C:\\NotesFolder"
+    ]
+}

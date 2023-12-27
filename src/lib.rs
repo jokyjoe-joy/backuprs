@@ -7,13 +7,13 @@ use flate2::write::GzEncoder;
 use chrono;
 use mega::Node;
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use utils::AuthEnv;
+use utils::SettingsEnv;
 use log::{info, error, debug};
 
 mod utils;
 mod error;
 
-const SETTINGS_FILE: &str = "./auth_env.json";
+const SETTINGS_FILE: &str = "./settings.json";
 
 /// TODO! Document this
 /// 
@@ -152,7 +152,7 @@ impl Drop for BackupClient {
 /// # Errors
 ///
 /// * Returns `io::ErrorKind::AlreadyExists` if there is already a file with the name `file_name` 
-fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Check if file already exists.
     match Path::new(file_name).try_exists() {
         Ok(true) => return Err(error::TarballExistsError{file_name: String::from(file_name)}.into()),
@@ -167,13 +167,13 @@ fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<
 
     // Loop through each folder and append them to the archive.
 
-    for &dir in dirs.iter() {
+    for dir in dirs.iter() {
         // Get folder's name and path separately.
-        let dir_path = Path::new(dir);
+        let dir_path = Path::new(&dir);
         let dir_name = dir_path.file_name().unwrap();
 
         // Appends the directory with all its file.
-        tar.append_dir_all(dir_name, dir).unwrap();
+        tar.append_dir_all(dir_name, &dir).unwrap();
     }
 
     Ok(())
@@ -181,27 +181,21 @@ fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<
 
 #[tokio::main]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    const DIRS_TO_BACKUP: [&str; 4] = [
-        r"C:\Users\hollo\Documents\Bioinfo\blood_immuno",
-        r"C:\Users\hollo\Documents\Obsidian_notes", 
-        r"C:\Users\hollo\Documents\Finance",
-        r"C:\Users\hollo\Documents\Personal"
-    ];
+    let SettingsEnv { 
+        email: email_decoded, password: pass_decoded, dirs_to_backup
+    } = utils::read_auth_info(SETTINGS_FILE).unwrap();
 
     // Set archive's file name related to current date.
     let today_date = format!("{}", chrono::offset::Local::now().format("%Y-%m-%d"));
     let file_name = format!("backup{}.tar.gz", today_date);
 
     info!("Creating tarball from dirs:");
-    DIRS_TO_BACKUP.iter().for_each(|x| { info!("\t{}", x) });
+    dirs_to_backup.iter().for_each(|x| { info!("\t{}", x) });
 
-    create_tarball_from_dirs(DIRS_TO_BACKUP.to_vec(), &file_name)?;
+    create_tarball_from_dirs(dirs_to_backup, &file_name)?;
     info!("Created tarball successfully.");
     info!("Uploading file to MEGA.");
 
-    let AuthEnv { 
-        email: email_decoded, password: pass_decoded 
-    } = utils::read_auth_info(SETTINGS_FILE).unwrap();
     let mfa: Option<&str> = None;
 
     let mut client = BackupClient::default();
@@ -244,7 +238,7 @@ mod tests {
         // Create an archive of the source folder, therefore
         // this test can be run anytime, since `src` must exist
         // to build this binary.
-        let dirs = vec!["./src"];
+        let dirs = vec![String::from("./src")];
         let file_name = "testarchive.tar.gz";
         create_tarball_from_dirs(dirs, file_name).unwrap();
 
@@ -259,8 +253,8 @@ mod tests {
 
     #[tokio::test]
     async fn authentication() {
-        let AuthEnv { 
-            email: email_decoded, password: pass_decoded 
+        let SettingsEnv { 
+            email: email_decoded, password: pass_decoded , ..
         } = utils::read_auth_info(SETTINGS_FILE).unwrap();
 
         let mut client = BackupClient::default();
@@ -272,8 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_remove_file() {
-        let AuthEnv { 
-            email: email_decoded, password: pass_decoded 
+        let SettingsEnv { 
+            email: email_decoded, password: pass_decoded , ..
         } = utils::read_auth_info(SETTINGS_FILE).unwrap();
 
         let mut client = BackupClient::default();

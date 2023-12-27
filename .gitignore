@@ -3,5 +3,5 @@
 
 # BackupRS specific
 *.tar.gz
-auth_env.json
+settings.json
 *.log
