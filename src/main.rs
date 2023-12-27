@@ -7,11 +7,19 @@
 use chrono::Local;
 mod error;
 
+/// Current version of backup.rs, read from Cargo.toml.
+/// It is an `Option<&str>`, because if the lib is not compiled
+/// with cargo, it will be `None`.
+const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
+const PKG_NAME: Option<&str> = option_env!("CARGO_PKG_NAME");
+
 fn setup_logger() -> Result<(), fern::InitError> {
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[{} {} {}] {}",
+                "[{}v{} - {} {} {}] {}",
+                PKG_NAME.unwrap_or("LIB-NO-CARGO"),
+                VERSION.unwrap_or("V?.?.?"),
                 Local::now().format("%Y-%m-%d -- %H:%M:%S"),
                 record.level(),
                 record.target(),

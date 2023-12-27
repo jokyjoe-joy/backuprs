@@ -1,6 +1,6 @@
 [package]
 name = "backuprs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,13 +9,13 @@ edition = "2021"
 chrono = "0.4.31"
 flate2 = "1.0.28"
 tar = "0.4.40"
-mega = "0.7.0"
+# Uses customized `mega-rs` when used locally, and uses
+# version 0.7.0 from crates.io when published.
+# N.B. that if a version doesn't match, Cargo will fail to compile!
+mega = { path = "../mega-rs", version = "0.7.0" }
 reqwest = "0.11.23"
-indicatif = "0.17.7"
-console = "0.15.7"
 tokio = { version = "1.35.1", features = ["full"] }
 tokio-util = "0.7.10"
-async-read-progress = "0.2.0"
 serde_json = "1.0.108"
 base64 = "0.21.5"
 serde = "1.0.193"

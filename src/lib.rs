@@ -5,15 +5,15 @@ use std::path::Path;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use chrono;
-use std::sync::Arc;
-use async_read_progress::TokioAsyncReadProgressExt;
-use std::time::Duration;
+use mega::Node;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use utils::AuthEnv;
-use log::{info, error};
+use log::{info, error, debug};
 
 mod utils;
 mod error;
+
+const SETTINGS_FILE: &str = "./auth_env.json";
 
 /// TODO! Document this
 /// 
@@ -34,8 +34,27 @@ impl BackupClient {
     }
 
     pub async fn login(&mut self, email: &str, password: &str, mfa: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Logging in with email: {email}...");
         self.mega_client.login(email, password, mfa).await?;
         Ok(())
+    }
+
+    pub async fn logout(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Logging out...");
+        // TODO: For some reason `Drop` is not calling (or waiting for) this function to finish.
+        self.mega_client.logout().await?;
+        Ok(())
+    }
+
+    // For some reason if you make `try_logout` a public function, `Drop` will not be able
+    // to call this function, therefore it won't be able to log out when client goes out of scope.
+    // tokio::spawn will just go nuts. But why?
+    async fn try_logout(&mut self) {
+        debug!("Trying to log out...");
+        match self.logout().await {
+            Ok(()) => info!("Successfully log out."),
+            Err(e) => error!("Logout error: {:?}", e)
+        }
     }
 
     /// Uploads file to an already created folder in MEGA drive.
@@ -47,17 +66,25 @@ impl BackupClient {
     pub async fn upload_file(&self, file_name: &str, dest_folder: &str) -> Result<(), Box<dyn std::error::Error>> {
         let nodes = self.mega_client.fetch_own_nodes().await?;
         let file_name = Path::new(file_name).file_name().unwrap().to_str().unwrap();
-        
-        // Filters nodes to only contain folders with the name of `dest_folder`.
-        let folder_nodes: Vec<_> = nodes.iter().filter(|&node| {
-            node.name() == dest_folder && node.kind() == mega::NodeKind::Folder
-        }).collect();
+        let dest_folder_node: &Node;
 
-        if folder_nodes.len() > 1 { return Err(error::UploadError::MultipleFoldersError.into()); }
-        else if folder_nodes.len() < 1 { return Err(error::UploadError::NoFolderError.into()); }
-        
-        // The node of `dest_folder` must be the only one in the vector.
-        let dest_folder_node = *folder_nodes.first().unwrap();
+        // Only check folder nodes if not trying to upload to root folder.
+        // TODO: Upload by path? Therefore can upload files if there are 
+        // multiple folders with same name.
+        if dest_folder != "/" {
+            // Filters nodes to only contain folders with the name of `dest_folder`.
+            let folder_nodes: Vec<&Node> = nodes.iter().filter(|&node| {
+                node.name() == dest_folder && node.kind() == mega::NodeKind::Folder
+            }).collect();
+
+            if folder_nodes.len() > 1 { return Err(error::UploadError::MultipleFoldersError.into()); }
+            else if folder_nodes.len() < 1 { return Err(error::UploadError::NoFolderError.into()); }
+            
+            // The node of `dest_folder` must be the only one in the vector.
+            dest_folder_node = folder_nodes.first().unwrap();
+        } else {
+            dest_folder_node = nodes.cloud_drive().unwrap();
+        }
 
         // Check if a file with the same name is already uploaded in the same folder.
         let file_nodes : Vec<_> = nodes.iter().filter(|&node| { 
@@ -75,29 +102,13 @@ impl BackupClient {
         let file = tokio::fs::File::open(file_name).await?;
         let size = file.metadata().await?.len();
 
-        // TODO! Remove progressbar?
-        // Setting up progressbar
-        let bar = indicatif::ProgressBar::new(size);
-        bar.set_style(utils::progress_bar_style());
-        bar.set_message(format!("Uploading {} to {}...", file_name, dest_folder_node.name()));
-        let bar = Arc::new(bar);
-
-        let reader = {
-            let bar = bar.clone();
-            file.report_progress(Duration::from_millis(100), move |bytes_read| {
-                bar.set_position(bytes_read as u64);
-            })
-        };
-
         self.mega_client.upload_node(
             &dest_folder_node,
             file_name,
             size,
-            reader.compat(),
+            file.compat(),
             mega::LastModified::Now,
         ).await?;
-
-        bar.finish_with_message(format!("{} uploaded to {} !", file_name, dest_folder_node.name()));
 
         Ok(())
     }
@@ -108,15 +119,25 @@ impl BackupClient {
 // in its place, but this runs into a problem; you'll end up with a stack 
 // overflow calling drop. So, we have to use a flag to indicate it's been dropped.
 // For more info, see: https://stackoverflow.com/questions/71541765/rust-async-drop
+// It is necessary to drop `client` and initiate a logout, because if we stay logged in,
+// there will be a lot of open sessions to the MEGA account (You can see it in
+// MEGA --> Settings --> Session history).
+// TODO! Please check whether async drop is already implemented in Rust:
+// https://rust-lang.github.io/async-fundamentals-initiative/index.html
 impl Drop for BackupClient {
     fn drop(&mut self) {
         if !self.dropped {
+            debug!("Found `BackupClient` out of scope not dropped, dropping it...");
             let mut this = BackupClient::default();
             // `self` would escape the method body, therefore it is necessary to
             // swap the values.
             std::mem::swap(&mut this, self);
             this.dropped = true;
-            tokio::spawn(async move { this.mega_client.logout().await });
+            debug!("Spawning logout task...");
+            tokio::spawn(async move { 
+                debug!("Spawned thread logging out!");
+                this.try_logout().await
+            });
         }
     }
 }
@@ -139,12 +160,6 @@ fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<
         Err(e) => return Err(e.into())
     };
 
-    // Setting up progressbar
-    let bar = indicatif::ProgressBar::new(dirs.len() as u64);
-    bar.set_style(utils::progress_bar_style());
-    bar.set_message("Creating tarball...");
-    let bar = Arc::new(bar);
-
     // Create the archive file.
     let tar_gz = std::fs::File::create(file_name)?;
     let enc = GzEncoder::new(tar_gz, Compression::best());
@@ -152,23 +167,19 @@ fn create_tarball_from_dirs(dirs: Vec<&str>, file_name: &str) -> Result<(), Box<
 
     // Loop through each folder and append them to the archive.
 
-    for (count, &dir) in dirs.iter().enumerate() {
+    for &dir in dirs.iter() {
         // Get folder's name and path separately.
         let dir_path = Path::new(dir);
         let dir_name = dir_path.file_name().unwrap();
-
-        bar.set_position(count as u64);
 
         // Appends the directory with all its file.
         tar.append_dir_all(dir_name, dir).unwrap();
     }
 
-    bar.finish_with_message(format!("Created a tarball with the name {} !", file_name));
-
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     const DIRS_TO_BACKUP: [&str; 4] = [
         r"C:\Users\hollo\Documents\Bioinfo\blood_immuno",
@@ -188,18 +199,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Created tarball successfully.");
     info!("Uploading file to MEGA.");
 
-    let settings_file = "./auth_env.json";
-    let AuthEnv { email: email_decoded, password: pass_decoded } = utils::read_auth_info(settings_file).unwrap();
+    let AuthEnv { 
+        email: email_decoded, password: pass_decoded 
+    } = utils::read_auth_info(SETTINGS_FILE).unwrap();
     let mfa: Option<&str> = None;
 
     let mut client = BackupClient::default();
+
     client.login(&email_decoded, &pass_decoded, mfa).await?;
 
     match client.upload_file(&file_name, "Backups").await {
-        Ok(()) => (),
+        Ok(()) => {
+            // As long as Drop is not properly implemented, 
+            // log out after successfully uploading a file.
+            client.try_logout().await
+        },
         Err(e) => {
             // Cleanup before returning error to main.
             error!("Error encountered in `upload_file`, starting cleanup...");
+            error!("Trying to log out...");
+            client.try_logout().await;
             error!("Removing archive file...");
             std::fs::remove_file(&file_name)?;
             error!("Successfully removed archive file...");
@@ -238,5 +257,51 @@ mod tests {
         assert!(!file_path.exists())
     }
 
-    // TODO: Write tests for BackupClient.
+    #[tokio::test]
+    async fn authentication() {
+        let AuthEnv { 
+            email: email_decoded, password: pass_decoded 
+        } = utils::read_auth_info(SETTINGS_FILE).unwrap();
+
+        let mut client = BackupClient::default();
+        client.login(&email_decoded, &pass_decoded, None).await
+            .expect("Failure while logging in...");
+
+        client.logout().await.expect("Failure while logging out...");
+    }
+
+    #[tokio::test]
+    async fn upload_remove_file() {
+        let AuthEnv { 
+            email: email_decoded, password: pass_decoded 
+        } = utils::read_auth_info(SETTINGS_FILE).unwrap();
+
+        let mut client = BackupClient::default();
+        client.login(&email_decoded, &pass_decoded, None).await
+            .expect("Failure while logging in...");
+
+
+        // Uploading README.md because that's a file that must exist.
+        // TODO: `client.upload_file` should return uploaded file's Node,
+        // so it can be easier to delete it later (or do anything else with it).
+        // TODO: Create a randomly generated file (with random filename) to upload.
+        client.upload_file("README.md", "/").await
+            .expect("Uploading file has failed...");
+
+        let nodes = client.mega_client.fetch_own_nodes().await
+            .expect("Couldn't fetch own nodes.");
+
+        let node = nodes.get_node_by_path("/Root/README.md")
+            .expect("Couldn't get node by path...");
+
+        client.mega_client.delete_node(node).await
+            .expect("Couldn't delete node...");
+
+        let nonexistent_node = nodes.get_node_by_path("/README.md");
+        assert_eq!(nonexistent_node, None);
+
+        // FIXME: Explicit logouts are only necessary, until `Drop` is properly implemented.
+        client.logout().await.expect("Failure while logging out...");
+    }
+    
 }

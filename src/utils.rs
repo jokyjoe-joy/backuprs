@@ -1,20 +1,6 @@
 use serde::{Deserialize, Serialize};
 use base64::Engine;
 
-pub fn progress_bar_style() -> indicatif::ProgressStyle {
-    let template = format!(
-        "{}{{bar:30.magenta.bold/magenta/bold}}{} {{percent}} % (ETA {{eta}}): {{msg}}",
-        console::style("▐").bold().magenta(),
-        console::style("▌").bold().magenta(),
-    );
-
-    indicatif::ProgressStyle::default_bar()
-        .progress_chars("▨▨╌")
-        .template(template.as_str())
-        .unwrap()
-}
-
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AuthEnv {
     pub email: String,
