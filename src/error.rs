@@ -2,7 +2,6 @@
 // Practically could even be replaced by a macro,
 // but there must be an easier way to do this.
 // See other crates for more.
-use thiserror::Error;
 
 
 #[derive(Debug)]
@@ -41,12 +40,4 @@ impl std::fmt::Display for MEGAFileExistsError {
             self.file_name
         )
     }
-}
-
-#[derive(Debug, Error)]
-pub enum UploadError {
-    #[error("Multiple folders found in drive with specified name.")]
-    MultipleFoldersError,
-    #[error("No folder is found in drive with specified name.")]
-    NoFolderError
 }

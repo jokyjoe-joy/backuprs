@@ -8,19 +8,18 @@ use chrono;
 use mega::Node;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use utils::SettingsEnv;
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 
 mod utils;
 mod error;
 
 const SETTINGS_FILE: &str = "./settings.json";
 
-/// TODO! Document this
-/// 
-/// Note: `mega_client.logout()` is called when the struct is dropped.
 struct BackupClient {
     mega_client: mega::Client,
-    dropped: bool
+    dropped: bool,
+    backup_folder: String,
+    backup_node: Option<Node>
 }
 
 impl BackupClient {
@@ -29,13 +28,54 @@ impl BackupClient {
         let client = mega::Client::builder().build(http_client).unwrap();
         BackupClient {
             mega_client: client,
-            dropped: false
+            dropped: false,
+            backup_folder: String::from("/Root/Backups"),
+            backup_node: None
         }
     }
 
+    pub fn new(backup_folder: String) -> Self {
+        let http_client = reqwest::Client::new();
+        let client = mega::Client::builder().build(http_client).unwrap();
+        BackupClient {
+            mega_client: client,
+            dropped: false,
+            backup_folder: backup_folder,
+            backup_node: None
+        }
+    }
+
+    /// Logs into the MEGA service using the provided credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `email`: The email address associated with the MEGA account.
+    /// * `password`: The password for the MEGA account.
+    /// * `mfa`: An optional multi-factor authentication (MFA) code if MFA is enabled for the account.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` indicating success or failure. In case of an error during the login process,
+    /// it returns an `Err` containing the error information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is an issue during the login process, such as invalid credentials or
+    /// network-related problems.
+    ///
+    /// # Remarks
+    ///
+    /// After successful login, the function fetches the nodes associated with the MEGA account and
+    /// attempts to retrieve the node corresponding to the specified backup folder. The retrieved node
+    /// is then stored in the `backup_node` field of the `BackupClient` for later use.
     pub async fn login(&mut self, email: &str, password: &str, mfa: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         info!("Logging in with email: {email}...");
         self.mega_client.login(email, password, mfa).await?;
+
+        let nodes = self.mega_client.fetch_own_nodes().await?;
+        let parent_node = nodes.get_node_by_path(&self.backup_folder);
+        self.backup_node = parent_node.cloned();
+
         Ok(())
     }
 
@@ -57,64 +97,121 @@ impl BackupClient {
         }
     }
 
-    /// Uploads file to an already created folder in MEGA drive.
+    /// Checks for obsolete backup nodes in the client's `backup_node` based on the specified criteria.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_backups`: The maximum number of backups to keep. If the total number of backup nodes
+    ///   exceeds this limit, the function considers the oldest nodes as obsolete.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing either `Some(Vec<Node>)` with the obsolete backup nodes
+    /// or `None` if no obsolete nodes are found. In case of an error during the operation,
+    /// it returns an `Err` containing the error information.
+    ///
+    /// # Errors
+    ///
+    /// * Returns an error if there is an issue fetching the nodes from the MEGA client.
+    /// * Returns an error if `self.backup_node` is None.
+    pub async fn find_obsolete_nodes(&self, max_backups: usize) -> Result<Option<Vec<Node>>, Box<dyn std::error::Error>> {
+        info!("Checking if there are more than {:?} backups.", max_backups);
+        let nodes = self.mega_client.fetch_own_nodes().await?;
+        
+        let mut backup_nodes: Vec<Node> = nodes.into_iter()
+        .filter(|node| {
+            node.parent() == Some(self.backup_node.as_ref().expect("Backup node must be already defined to find obsolete nodes.").handle())
+            && node.name().contains(".tar.gz") 
+            && node.name().contains("backup")
+        })
+        .collect();
+
+        if backup_nodes.len() > max_backups {
+            backup_nodes.sort_by_key(|x| { x.created_at() });
+    
+            let no_of_obsolete_nodes = backup_nodes.len() - max_backups;
+            info!("Found {:?} obsolete node(s).", no_of_obsolete_nodes);
+    
+            Ok(Some(backup_nodes.into_iter().take(no_of_obsolete_nodes).collect()))
+
+        } else {
+            info!("Not found any obsolete nodes.");
+            Ok(None)
+        }
+    }
+
+    /// Removes all nodes that are specified as an argument.
     /// 
     /// # Arguments
     /// 
-    /// * `file_name` - A string slice with the name of the file to upload
-    /// * `dest_folder` - A string slice with the name of the destination directory, which must be already created in the drive
-    pub async fn upload_file(&self, file_name: &str, dest_folder: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let nodes = self.mega_client.fetch_own_nodes().await?;
-        let file_name = Path::new(file_name).file_name().unwrap().to_str().unwrap();
-        let dest_folder_node: &Node;
-
-        // Only check folder nodes if not trying to upload to root folder.
-        // TODO: Upload by path? Therefore can upload files if there are 
-        // multiple folders with same name.
-        if dest_folder != "/" {
-            // Filters nodes to only contain folders with the name of `dest_folder`.
-            let folder_nodes: Vec<&Node> = nodes.iter().filter(|&node| {
-                node.name() == dest_folder && node.kind() == mega::NodeKind::Folder
-            }).collect();
-
-            if folder_nodes.len() > 1 { return Err(error::UploadError::MultipleFoldersError.into()); }
-            else if folder_nodes.len() < 1 { return Err(error::UploadError::NoFolderError.into()); }
-            
-            // The node of `dest_folder` must be the only one in the vector.
-            dest_folder_node = folder_nodes.first().unwrap();
-        } else {
-            dest_folder_node = nodes.cloud_drive().unwrap();
+    /// * `obsolete_nodes` - Vector of nodes that must be deleted.
+    pub async fn remove_obsolete_nodes(&self, obsolete_nodes: Vec<Node>) -> Result<(), Box<dyn std::error::Error>> {
+        for node in obsolete_nodes.iter() {
+            info!("Deleting node {:?}...", node.name());
+            self.mega_client.delete_node(node).await?;
         }
-
-        // Check if a file with the same name is already uploaded in the same folder.
-        let file_nodes : Vec<_> = nodes.iter().filter(|&node| { 
-            node.name() == file_name && 
-            node.kind() == mega::NodeKind::File && 
-            node.parent() == Some(dest_folder_node.handle())
-        }).collect();
-
-        // If there is a file with the same name in the same folder, return an error.
-        if file_nodes.len() > 0 { 
-            return Err(error::MEGAFileExistsError{ file_name: String::from(file_name) }.into()); 
-        }
-
-        // Open file and read size to specify the length of the progress bar.
-        let file = tokio::fs::File::open(file_name).await?;
-        let size = file.metadata().await?.len();
-
-        self.mega_client.upload_node(
-            &dest_folder_node,
-            file_name,
-            size,
-            file.compat(),
-            mega::LastModified::Now,
-        ).await?;
 
         Ok(())
     }
+
+    /// Uploads a file to the client's MEGA backup folder node.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name` - The name of the file to be uploaded.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` with an empty `Ok(())` on successful upload or an error on failure.
+    ///
+    /// # Errors
+    ///
+    /// The function can return errors in the form of a `Box<dyn std::error::Error>`. Possible errors include:
+    /// * `MEGAFileExistsError` if a file with the same name already exists in the specified folder.
+    /// * I/O errors, file opening errors, or any other errors that may occur during the upload process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the file name cannot be converted to a valid UTF-8 string or if there is an issue with
+    /// fetching own nodes or getting file metadata.
+    pub async fn upload_file(&self, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(dest_folder_node) = &self.backup_node {
+            let nodes = self.mega_client.fetch_own_nodes().await?;
+            let file_name = Path::new(file_name).file_name().unwrap().to_str().unwrap();
+    
+            // Check if a file with the same name is already uploaded in the same folder.
+            let file_nodes : Vec<_> = nodes.iter().filter(|&node| { 
+                node.name() == file_name && 
+                node.kind() == mega::NodeKind::File && 
+                node.parent() == Some(dest_folder_node.handle())
+            }).collect();
+    
+            // If there is a file with the same name in the same folder, return an error.
+            if file_nodes.len() > 0 { 
+                return Err(error::MEGAFileExistsError{ file_name: String::from(file_name) }.into()); 
+            }
+    
+            // Open file and read size to specify the length of the progress bar.
+            let file = tokio::fs::File::open(file_name).await?;
+            let size = file.metadata().await?.len();
+    
+            self.mega_client.upload_node(
+                &dest_folder_node,
+                file_name,
+                size,
+                file.compat(),
+                mega::LastModified::Now,
+            ).await?;
+
+            Ok(())
+        } else {
+            warn!("Tried to upload a file while there was no backup node specified!");
+            Ok(())
+        }
+    }
 }
 
-// When the client goes out of scope, user is gracefully logout first.
+// When the client goes out of scope, user is gracefully logged out first.
 // First thought would be to call std::mem::take, which leaves a default
 // in its place, but this runs into a problem; you'll end up with a stack 
 // overflow calling drop. So, we have to use a flag to indicate it's been dropped.
@@ -198,16 +295,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mfa: Option<&str> = None;
 
-    let mut client = BackupClient::default();
+    let mut client = BackupClient::new(String::from("/Root/Backups"));
 
     client.login(&email_decoded, &pass_decoded, mfa).await?;
 
-    match client.upload_file(&file_name, "Backups").await {
-        Ok(()) => {
-            // As long as Drop is not properly implemented, 
-            // log out after successfully uploading a file.
-            client.try_logout().await
-        },
+    match client.upload_file(&file_name).await {
+        Ok(()) => (),
         Err(e) => {
             // Cleanup before returning error to main.
             error!("Error encountered in `upload_file`, starting cleanup...");
@@ -221,6 +314,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("Uploaded file successfully.");
+
+    let obsolete_nodes = client.find_obsolete_nodes(10).await?;
+
+    if let Some(nodes) = obsolete_nodes {
+        client.remove_obsolete_nodes(nodes).await?;
+    }
+
+    client.try_logout().await;
 
     info!("Removing archive file...");
     std::fs::remove_file(file_name)?;
@@ -270,7 +371,7 @@ mod tests {
             email: email_decoded, password: pass_decoded , ..
         } = utils::read_auth_info(SETTINGS_FILE).unwrap();
 
-        let mut client = BackupClient::default();
+        let mut client = BackupClient::new(String::from("/Root/Backups"));
         client.login(&email_decoded, &pass_decoded, None).await
             .expect("Failure while logging in...");
 
@@ -279,13 +380,13 @@ mod tests {
         // TODO: `client.upload_file` should return uploaded file's Node,
         // so it can be easier to delete it later (or do anything else with it).
         // TODO: Create a randomly generated file (with random filename) to upload.
-        client.upload_file("README.md", "/").await
+        client.upload_file("README.md").await
             .expect("Uploading file has failed...");
 
         let nodes = client.mega_client.fetch_own_nodes().await
             .expect("Couldn't fetch own nodes.");
 
-        let node = nodes.get_node_by_path("/Root/README.md")
+        let node = nodes.get_node_by_path("/Root/Backups/README.md")
             .expect("Couldn't get node by path...");
 
         client.mega_client.delete_node(node).await
@@ -297,5 +398,4 @@ mod tests {
         // FIXME: Explicit logouts are only necessary, until `Drop` is properly implemented.
         client.logout().await.expect("Failure while logging out...");
     }
-    
 }
