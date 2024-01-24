@@ -1,7 +1,7 @@
 //! **B**asic **A**utomated **C**loud **K**eeper for **U**ltimate **P**ersistence
 //! aka. BACKUP.rs
 
-use std::{fs::File, path::Path};
+use std::{fs::File, os::windows::fs::MetadataExt, path::Path};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use chrono;
@@ -258,7 +258,7 @@ impl Drop for BackupClient {
 /// * Any error that occurs during file operations, such as file creation, reading, or appending
 ///   to the tarball.
 ///
-fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str, ignore_folders: Option<Vec<String>>) -> Result<(), Box<dyn std::error::Error>> {
+fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str, max_file_mb: u64, ignore_folders: Option<Vec<String>>) -> Result<(), Box<dyn std::error::Error>> {
     // Check if file already exists.
     match Path::new(file_name).try_exists() {
         Ok(true) => return Err(error::TarballExistsError{file_name: String::from(file_name)}.into()),
@@ -275,10 +275,18 @@ fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str, ignore_folders: 
         let dir_contents = get_dir_contents(dir_path, &ignore_folders)?;
 
         for node_path in dir_contents.iter() {
-            debug!("Adding file to tarball: {:?}", node_path);
             // Open file that will be later appended to the tar.
             let mut f = File::open(&node_path)?;
             
+            let file_size_bytes = f.metadata().unwrap().file_size();
+            let bytes_in_mb = 1048576;
+            let file_size_mb = file_size_bytes / bytes_in_mb;
+            if file_size_mb > max_file_mb {
+                debug!("File of {:?} MB is ignored: {:?}", file_size_mb, node_path);
+                continue;
+            }
+            
+            debug!("Adding file ({:?} MB) to tarball: {:?}", file_size_mb, node_path);
             // Convert absolute path to relative path from `dir_path`.
             // E.g.: C:\\Users\\username\\Documents\\My\\Path\\backup_folder\\Makefile"
             // ----> "backup_folder\\Makefile"
@@ -349,7 +357,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating tarball from dirs:");
     dirs_to_backup.iter().for_each(|x| { info!("\t{}", x) });
 
-    create_tarball_from_dirs(dirs_to_backup, &file_name, Some(dirs_to_ignore))?;
+    create_tarball_from_dirs(dirs_to_backup, &file_name, 512, Some(dirs_to_ignore))?;
     info!("Created tarball successfully.");
     info!("Uploading file to MEGA.");
 
@@ -413,7 +421,7 @@ mod tests {
         // to build this binary.
         let dirs = vec![String::from("./src")];
         let file_name = "testarchive.tar.gz";
-        create_tarball_from_dirs(dirs, file_name, None).unwrap();
+        create_tarball_from_dirs(dirs, file_name, 512, None).unwrap();
 
         let file_path = Path::new(file_name);
 
