@@ -1,7 +1,7 @@
 //! **B**asic **A**utomated **C**loud **K**eeper for **U**ltimate **P**ersistence
 //! aka. BACKUP.rs
 
-use std::path::Path;
+use std::{fs::File, path::Path};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use chrono;
@@ -239,17 +239,26 @@ impl Drop for BackupClient {
     }
 }
 
-/// Creates a tar.gz archive from all the folder paths that are given in `dirs`.
+/// Creates a tarball archive from the specified list of directories, saving it to the
+/// given file name. Optionally, you can provide a list of folder names to be ignored.
 /// 
 /// # Arguments
 /// 
-/// * `dirs` - A vector of string slices that holds the path of directories
-/// * `file_name` - A string slice that holds the name of the archive with file extension
+/// * `dirs` - A vector of strings representing the absolute paths to the directories to
+///            be included in the tarball.
+/// * `file_name` - The name of the tarball file to be created.
+/// * `ignore_folders` - An optional vector of strings containing folder names to be ignored
+///                      during the tarball creation process.
 /// 
 /// # Errors
 ///
-/// * Returns `io::ErrorKind::AlreadyExists` if there is already a file with the name `file_name` 
-fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// This function returns a `Result<(), Box<dyn std::error::Error>>`. Possible error variants
+/// include:
+/// * `TarballExistsError` - Returned if the specified tarball file already exists.
+/// * Any error that occurs during file operations, such as file creation, reading, or appending
+///   to the tarball.
+///
+fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str, ignore_folders: Option<Vec<String>>) -> Result<(), Box<dyn std::error::Error>> {
     // Check if file already exists.
     match Path::new(file_name).try_exists() {
         Ok(true) => return Err(error::TarballExistsError{file_name: String::from(file_name)}.into()),
@@ -262,25 +271,76 @@ fn create_tarball_from_dirs(dirs: Vec<String>, file_name: &str) -> Result<(), Bo
     let enc = GzEncoder::new(tar_gz, Compression::best());
     let mut tar = tar::Builder::new(enc);
 
-    // Loop through each folder and append them to the archive.
+    for dir_path in dirs.iter() {
+        let dir_contents = get_dir_contents(dir_path, &ignore_folders)?;
 
-    for dir in dirs.iter() {
-        // Get folder's name and path separately.
-        let dir_path = Path::new(&dir);
-        let dir_name = dir_path.file_name().unwrap();
+        for node_path in dir_contents.iter() {
+            debug!("Adding file to tarball: {:?}", node_path);
+            // Open file that will be later appended to the tar.
+            let mut f = File::open(&node_path)?;
+            
+            // Convert absolute path to relative path from `dir_path`.
+            // E.g.: C:\\Users\\username\\Documents\\My\\Path\\backup_folder\\Makefile"
+            // ----> "backup_folder\\Makefile"
+            let backup_abs_folder_path = format!("{}\\", dir_path);
+            let backup_folder_name = dir_path.split("\\").last().unwrap();
+            let relative_path = format!("{}\\{}", backup_folder_name, node_path.trim_start_matches(&backup_abs_folder_path));
 
-        // Appends the directory with all its file.
-        tar.append_dir_all(dir_name, &dir).unwrap();
+            tar.append_file(Path::new(&relative_path), &mut f)?;
+
+        }
     }
 
+    let _ = tar.finish();
+
     Ok(())
+}
+
+/// Recursively retrieves the contents (files and subdirectories' files) of the specified directory,
+/// excluding those listed in the optional `ignore_folders` vector.
+/// 
+/// # Arguments
+/// 
+/// * `dir` - A string representing the path to the directory whose contents are to be retrieved.
+/// * `ignore_folders` - An optional vector of strings containing folder names to be ignored
+///                      during the retrieval process.
+/// 
+/// # Errors
+/// 
+/// Possible error variants include any errors that may occur during directory traversal or metadata retrieval.
+/// 
+/// # Returns
+/// 
+/// Returns a `Result` with a vector of strings holding the absolute path of the found files, or an error on failure.
+fn get_dir_contents(dir: &str, ignore_folders: &Option<Vec<String>>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let dir_contents = Path::new(&dir).read_dir()?;
+
+    let mut nodes_to_save: Vec<String> = Vec::new();
+
+    for node in dir_contents {
+        let node = node?;
+        if node.metadata()?.is_dir() {
+            if let Some(folders) = ignore_folders {
+                if folders.contains(&node.file_name().to_string_lossy().to_string()) {
+                    continue;
+                }
+            }
+
+            let mut node_contents = get_dir_contents(node.path().as_os_str().to_str().unwrap(), ignore_folders)?;
+            nodes_to_save.append(&mut node_contents);
+        } else {
+            nodes_to_save.push(node.path().to_string_lossy().to_string())
+        }
+    }
+
+    Ok(nodes_to_save)
 }
 
 #[tokio::main]
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let SettingsEnv { 
-        email: email_decoded, password: pass_decoded, dirs_to_backup
-    } = utils::read_auth_info(SETTINGS_FILE).unwrap();
+        email: email_decoded, password: pass_decoded, dirs_to_backup, dirs_to_ignore
+    } = utils::read_auth_info(SETTINGS_FILE)?;
 
     // Set archive's file name related to current date.
     let today_date = format!("{}", chrono::offset::Local::now().format("%Y-%m-%d"));
@@ -289,7 +349,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating tarball from dirs:");
     dirs_to_backup.iter().for_each(|x| { info!("\t{}", x) });
 
-    create_tarball_from_dirs(dirs_to_backup, &file_name)?;
+    create_tarball_from_dirs(dirs_to_backup, &file_name, Some(dirs_to_ignore))?;
     info!("Created tarball successfully.");
     info!("Uploading file to MEGA.");
 
@@ -335,13 +395,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retrieve_dir_contents() {
+        let expected_contents = vec![
+            String::from("src\\lib.rs"), 
+            String::from("src\\main.rs")
+        ];
+
+        let contents = get_dir_contents("src", &None).unwrap();
+        
+        assert!(expected_contents.iter().all(|item| contents.contains(item)));
+    }
+
+    #[test]
     fn create_tarball() {
         // Create an archive of the source folder, therefore
         // this test can be run anytime, since `src` must exist
         // to build this binary.
         let dirs = vec![String::from("./src")];
         let file_name = "testarchive.tar.gz";
-        create_tarball_from_dirs(dirs, file_name).unwrap();
+        create_tarball_from_dirs(dirs, file_name, None).unwrap();
 
         let file_path = Path::new(file_name);
 

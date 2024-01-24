@@ -5,7 +5,8 @@ use base64::Engine;
 pub struct SettingsEnv {
     pub email: String,
     pub password: String,
-    pub dirs_to_backup: Vec<String>
+    pub dirs_to_backup: Vec<String>,
+    pub dirs_to_ignore: Vec<String>
 }
 
 // TODO: Make this function's example doc run?!
@@ -13,7 +14,7 @@ pub struct SettingsEnv {
 /// 
 /// # Returns
 /// 
-/// * An `AuthEnv` struct of base64 decoded credentials with the structure of `{ email, password }`
+/// * An `AuthEnv` struct of base64 decoded credentials and settings
 /// 
 /// # Examples
 /// ```ignore
@@ -40,6 +41,7 @@ pub fn read_auth_info(file_path: &str) -> Result<SettingsEnv, Box<dyn std::error
     Ok(SettingsEnv {
         email,
         password,
-        dirs_to_backup: auth_info.dirs_to_backup
+        dirs_to_backup: auth_info.dirs_to_backup,
+        dirs_to_ignore: auth_info.dirs_to_ignore
     })
 }

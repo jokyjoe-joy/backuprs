@@ -38,20 +38,10 @@ fn main() {
     match backuprs::run() {
         Ok(()) => (),
         Err(e) => {
-            // TODO: There must be an easier and simpler way to do this.
-            // TODO: Check for MultipleFoldersError, etc.?
-            if 
-                e.is::<error::TarballExistsError>() || 
-                e.is::<error::MEGAFileExistsError>()
-            {
-                log::error!("{}", e);
-            }
-            else {
-                // Panic if unknown error has been found, since this
-                // can only happen if there is a bug in the application.
-                log::error!("{:?}", e);
-                panic!("{:?}", e);
-            }
+            // Panic if unknown error has been found, since this
+            // can only happen if there is a bug in the application.
+            log::error!("{:?}", e);
+            panic!("{:?}", e);
         }
     };
 }

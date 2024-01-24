@@ -4,5 +4,11 @@
     "dirs_to_backup": [
         "C:\\Users\\username\\Documents\\BackupFolder",
         "C:\\NotesFolder"
+    ],
+    "dirs_to_ignore": [
+        ".git",
+        ".venv",
+        ".trash",
+        "__pycache__"
     ]
 }
